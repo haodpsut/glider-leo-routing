@@ -13,6 +13,9 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
+# Keep per-step progress visible when this script's output is piped (tee, tmux, nohup).
+export PYTHONUNBUFFERED=1
+
 SEEDS=${SEEDS:-"1 2 3"}
 N_EVAL=${N_EVAL:-50}
 EVAL_SEED=${EVAL_SEED:-1000}   # scenario-sampling seed, held fixed across models

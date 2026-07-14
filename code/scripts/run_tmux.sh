@@ -88,8 +88,13 @@ ln -sf "${LOG_FILE}" "${LATEST}"
 
 # The experiment command. `conda run` avoids needing an interactive shell hook, and
 # `stdbuf -oL` keeps the log line-buffered so --status shows live progress.
+# PYTHONUNBUFFERED is essential: python block-buffers stdout when piped into tee, so
+# without it the per-step progress lines sit in a buffer for minutes and the log pane
+# looks frozen. stdbuf alone does not help, since it does not propagate to the python
+# grandchild that conda run spawns.
 RUN_CMD="cd '${CODE_DIR}' && \
 SEEDS='${SEEDS}' N_EVAL='${N_EVAL}' CUDA_VISIBLE_DEVICES='${CUDA_VISIBLE_DEVICES}' \
+PYTHONUNBUFFERED=1 \
 stdbuf -oL -eL conda run --no-capture-output -n '${ENV_NAME}' \
 bash scripts/run_full.sh 2>&1 | tee '${LOG_FILE}'; \
 echo; echo '=== run finished (exit=\$?) ==='; echo 'Press any key to close.'; read -n 1"
