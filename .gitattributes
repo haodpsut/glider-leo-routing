@@ -1,0 +1,16 @@
+# Shell scripts must always be checked out with LF, even on Windows: a CRLF in a
+# script makes Linux fail with "bad interpreter: /bin/bash^M".
+*.sh text eol=lf
+
+# Keep the rest of the source tree normalised to LF in the repository.
+*.py   text eol=lf
+*.yaml text eol=lf
+*.yml  text eol=lf
+*.tex  text eol=lf
+*.bib  text eol=lf
+*.md   text eol=lf
+
+# Binary artefacts must never be line-ending converted.
+*.pdf binary
+*.pt  binary
+*.png binary
