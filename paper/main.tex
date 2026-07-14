@@ -1,0 +1,299 @@
+\documentclass[conference]{IEEEtran}
+\IEEEoverridecommandlockouts
+
+\usepackage{cite}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{amsthm}
+\usepackage{algorithmic}
+\usepackage{graphicx}
+\usepackage{textcomp}
+\usepackage{xcolor}
+\usepackage{booktabs}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta,positioning,fit,backgrounds,calc}
+\usepackage[hidelinks]{hyperref}
+
+\newtheorem{lemma}{Lemma}
+\newtheorem{proposition}{Proposition}
+\newtheorem{corollary}{Corollary}
+
+\begin{document}
+
+\title{GLIDER: Inductive Graph-Learned Distributed\\ Congestion-Aware Routing for LEO Mega-Constellations}
+
+\author{\IEEEauthorblockN{Anonymous Submission}
+\IEEEauthorblockA{IEEE INFOCOM 2027 Submission}}
+
+\maketitle
+
+\begin{abstract}
+Low Earth orbit (LEO) mega-constellations carry traffic over an inter-satellite-link (ISL) mesh whose topology changes on the scale of seconds. The de facto routing rule, shortest path on propagation delay, is congestion oblivious: under skewed demand it drives a few links into saturation, dropping demand while the rest of the mesh sits idle. Congestion-aware routing recovers that capacity, but the standard formulation is a centralized convex program over the full instantaneous traffic matrix, which cannot be solved and redistributed faster than the constellation re-forms. We formalize distributed congestion-aware LEO routing as a decentralized routing problem in which each node's forwarding decision may depend only on its local neighbourhood and the destination, and we show that within the natural class of greedy policies the problem reduces to estimating a single object: the congestion-aware \emph{cost-to-go}. We prove that greedy forwarding on an exact cost-to-go is optimal and loop free, and that under an $\varepsilon$-accurate estimate the path cost degrades by at most $2\varepsilon H$ over $H$ hops, which shows that what matters is the \emph{ranking} of neighbours, not the absolute accuracy of the estimate. GLIDER learns this estimator with an inductive message-passing network trained by a next-hop imitation objective derived from that bound. Because the estimator is size agnostic, one trained model applies zero shot to unseen constellation geometries and to failed links, and each decision uses only local state. On a self-contained LEO simulator with an M/M/1 flow-delay model we quantify the opportunity a distributed policy can target and evaluate the learned policy against it across multiple independently trained seeds, unseen shells, and ISL failure rates up to 20\%. Code and the full experiment pipeline are released.
+\end{abstract}
+
+\begin{IEEEkeywords}
+LEO satellite networks, inter-satellite links, congestion-aware routing, graph neural networks, inductive learning.
+\end{IEEEkeywords}
+
+\section{Introduction}
+Commercial LEO constellations such as Starlink and Kuiper connect ground stations through a mesh of inter-satellite links (ISLs) that reconfigures continuously as satellites sweep across the sky~\cite{handley2018delay,kassing2020hypatia}. Two properties make routing hard. First, the topology is time varying: relative geometry, and therefore link length and reachability, change second by second, and inter-plane links are switched off near the poles~\cite{bhattacherjee2019topology}. Second, demand is highly skewed toward a handful of population centres, so a routing rule that ignores load concentrates traffic on the few links along the geodesic and saturates them.
+
+The routing rule shipped by most LEO systems and by the reference Hypatia stack is shortest path on propagation delay~\cite{kassing2020hypatia}. It is simple and distributed, but congestion oblivious: it will overload a link even when a slightly longer detour is idle. Congestion-aware routing, in contrast, balances load across the mesh and recovers the wasted capacity. Its classical formulation with an M/M/1 delay model is a convex multi-commodity flow~\cite{kleinrock1975queueing,bertsekas1992data}, so it is tractable \emph{given global instantaneous state}. At the scale of a mega-constellation, whose topology changes faster than such a solve can be distributed, that assumption fails.
+
+This paper asks a precise question: what must a node know, and what must it compute, to route congestion-aware traffic using only local state? We answer it in three steps.
+
+\emph{A formulation with an explicit information constraint.} We state the centralized problem (P1) as a convex program under M/M/1 stability constraints, then impose a decentralization constraint that forwarding at node $u$ be a function of $u$'s local observation and the destination alone, yielding (P2). P2 is a team decision problem with non-classical information, and is not solved by relaxing P1.
+
+\emph{A reduction, with guarantees.} Within the class of greedy policies, P2 collapses to estimating one object, the congestion-aware cost-to-go $Q^\star(v,d)$. We prove greedy forwarding on $Q^\star$ is optimal and loop free (Lemma~\ref{lem:exact}), and that an $\varepsilon$-accurate estimate costs at most $2\varepsilon H$ over $H$ hops (Proposition~\ref{prop:approx}). The corollary is sharp and practically decisive: a decision is correct only when the neighbour cost gap exceeds $2\varepsilon$, so the estimator must be trained to \emph{rank} neighbours, not to minimize absolute regression error. Our experiments confirm this directly: cost-to-go regression alone, which attains an $\varepsilon$ of several milliseconds against per-hop gaps of a few milliseconds, produces wandering paths, and a next-hop ranking objective removes the pathology.
+
+\emph{An inductive estimator.} We realize $Q_\theta$ with a message-passing network whose features are normalized and size agnostic, so one trained model transfers zero shot to a larger constellation, a different inclination, or a mesh with failed links, and each forwarding decision needs only neighbour embeddings plus the destination embedding.
+
+\noindent\textbf{Contributions.}
+\begin{itemize}
+\item A formulation of distributed congestion-aware LEO routing with an explicit information constraint (Section~\ref{sec:problem}), and a reduction of the greedy policy class to cost-to-go estimation with an exactness lemma and an $\varepsilon$-approximation bound (Section~\ref{sec:method}) that dictates the training objective.
+\item GLIDER, an inductive, size-agnostic estimator with a loop-free distributed forwarder, trained by the next-hop imitation objective the bound implies.
+\item A reproducible evaluation over multiple independently trained seeds that quantifies the opportunity a distributed policy can target, measures zero-shot transfer to unseen shells, and tests robustness to ISL failure, together with ablations that isolate each component (Section~\ref{sec:results}).
+\end{itemize}
+
+\section{Related Work}
+\textbf{LEO routing.} Geographic and shortest-path schemes dominate deployed and simulated systems~\cite{handley2018delay,kassing2020hypatia,giuliari2020icarus}, with topology design work showing how ISL patterns shape achievable latency~\cite{bhattacherjee2019topology}. Congestion awareness has been added through deflection and load-balancing heuristics~\cite{lozano2022deflection,roth2021survey}, which reduce peak load but are hand-tuned per constellation. We instead learn the congestion-aware cost-to-go and transfer it across constellations.
+
+\textbf{Learning to route.} Graph neural networks have been used to model and optimize wired networks, notably RouteNet for delay estimation~\cite{rusek2020routenet} and deep reinforcement learning with GNNs for routing configuration~\cite{almasan2022drlgnn}. Learned LEO routing has been explored with per-topology models~\cite{markovitz2022deeproute}. We differ in targeting a cost-to-go that induces a distributed per-hop rule rather than a centralized configuration, and in treating inductivity and cross-constellation transfer as first-class requirements rather than training one model per topology.
+
+\textbf{Inductive graph learning.} GLIDER builds on inductive message passing~\cite{hamilton2017graphsage,gilmer2017mpnn}, whose representational limits are well characterized~\cite{xu2019gin,velickovic2018gat,kipf2017gcn}. We use these tools to make routing knowledge portable across topologies, the regime mega-constellations demand.
+
+\section{System Model and Problem Formulation}\label{sec:problem}
+
+\begin{table}[t]
+\centering
+\caption{Notation.}
+\label{tab:notation}
+\small
+\begin{tabular}{ll}
+\toprule
+Symbol & Meaning \\
+\midrule
+$G_t=(V,E_t)$ & directed snapshot graph at epoch $t$ \\
+$\tau_e,\;C_e$ & propagation delay, capacity of edge $e$ \\
+$\lambda_e$ & aggregate load on edge $e$ \\
+$\rho_e=\lambda_e/C_e$ & utilization of edge $e$ \\
+$L_e(\lambda_e)$ & M/M/1 link latency, Eq.~\eqref{eq:link} \\
+$\mathcal{D}$ & demand set $\{(s,d,\Lambda_{sd})\}$ \\
+$f^{(d)}_e$ & flow on $e$ destined for $d$ \\
+$\mathcal{N}(u)$ & out-neighbours of $u$ \\
+$O_u(t)$ & local observation available at $u$ \\
+$Q^\star(v,d)$ & congestion-aware cost-to-go from $v$ to $d$ \\
+$\pi$ & forwarding policy, $\pi(O_u(t),d)\in\mathcal{N}(u)$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Network and delay model}
+We model a Walker-delta constellation of $N$ satellites on circular orbits~\cite{walker1984constellations}, propagated analytically so a topology snapshot at any epoch is cheap. Satellites use a $+$Grid ISL pattern~\cite{kassing2020hypatia}: two intra-plane links, always up, and two inter-plane links, disabled above a polar cut-off latitude. Ground stations attach to any satellite above an elevation mask. The snapshot at epoch $t$ is a directed graph $G_t=(V,E_t)$ over satellite and ground-station nodes; edge $e=(u,v)$ has propagation delay $\tau_e=\lVert p_u-p_v\rVert/c$ and capacity $C_e$.
+
+Demand is a set $\mathcal{D}=\{(s,d,\Lambda_{sd})\}$ of directed ground-to-ground flows. Given per-edge load $\lambda_e$, we score each link with the M/M/1 flow-delay model~\cite{kleinrock1975queueing}: with $\rho_e=\lambda_e/C_e$ and service time $s_e$,
+\begin{equation}
+L_e(\lambda_e)=\tau_e+\frac{s_e}{1-\rho_e},\qquad 0\le\rho_e<1 .
+\label{eq:link}
+\end{equation}
+$L_e$ is continuous, strictly increasing and convex on $[0,C_e)$ and diverges as $\rho_e\to1$; a link with $\rho_e\ge1$ is unstable and its traffic is not delivered.
+
+\subsection{P1: the centralized problem}
+Let $f^{(d)}_e\ge0$ be the flow on edge $e$ destined for $d$, and $\lambda_e=\sum_d f^{(d)}_e$. The centralized congestion-aware routing problem is
+\begin{align}
+(\mathrm{P1})\quad \min_{f\ \ge 0}\quad & T(f)=\frac{1}{\Lambda}\sum_{e\in E_t}\lambda_e\,L_e(\lambda_e) \label{eq:p1obj}\\
+\text{s.t.}\quad & \sum_{e\in\mathrm{out}(v)}\! f^{(d)}_e-\!\!\sum_{e\in\mathrm{in}(v)}\! f^{(d)}_e = b^{(d)}_v,\;\;\forall v,d, \label{eq:c1}\\
+& \lambda_e=\textstyle\sum_d f^{(d)}_e \;<\; C_e,\qquad\forall e\in E_t, \label{eq:c2}\\
+& f^{(d)}_e\ \ge\ 0,\qquad\forall e,d, \label{eq:c3}
+\end{align}
+where $\Lambda=\sum_{sd}\Lambda_{sd}$ and $b^{(d)}_v$ is the net supply of commodity $d$ at $v$ ($\Lambda_{vd}$ at a source, $-\sum_s\Lambda_{sd}$ at $d$, zero otherwise). Constraint~\eqref{eq:c1} is flow conservation, \eqref{eq:c2} is the M/M/1 stability (capacity) constraint that makes~\eqref{eq:p1obj} finite, and~\eqref{eq:c3} is non-negativity. Since each $\lambda_e L_e(\lambda_e)$ is convex on $[0,C_e)$ and the constraints are linear, P1 is a convex program~\cite{bertsekas1992data}. It is therefore tractable, but only for a solver that knows $E_t$, $\{C_e,\tau_e\}$ and the entire demand matrix $\mathcal{D}$ at epoch $t$, and that can install the resulting $f$ before the topology changes.
+
+\subsection{P2: the distributed problem}
+Real constellations cannot meet that assumption. We therefore constrain the decision to be local. Let $O_u(t)$ denote the observation available at node $u$: the identities, link states and queue occupancies of its $k$-hop neighbourhood, plus a destination descriptor. A forwarding policy is a map
+\begin{equation}
+\pi:\;\big(O_u(t),\,d\big)\;\longmapsto\; v\in\mathcal{N}(u),
+\label{eq:policy}
+\end{equation}
+applied independently at every node. Write $\Pi_{\mathrm{loc}}$ for the class of such policies and $f(\pi)$ for the flow that results from all nodes applying $\pi$. The distributed problem is
+\begin{align}
+(\mathrm{P2})\quad \min_{\pi\in\Pi_{\mathrm{loc}}}\quad & T\big(f(\pi)\big) \\
+\text{s.t.}\quad & \text{\eqref{eq:c1}--\eqref{eq:c3} hold for } f(\pi), \\
+& \text{every routed path is simple (loop free).} \label{eq:c4}
+\end{align}
+P2 is not a relaxation of P1 and does not inherit its convexity: the decision variable is a \emph{policy} evaluated on partial observations, so P2 is a team decision problem with non-classical information, for which no efficient exact method is available in general. Two consequences shape our design. First, the loop-freedom requirement~\eqref{eq:c4} must be enforced by construction, since a per-node greedy rule on an imperfect estimate can otherwise cycle. Second, because $\pi$ is a function of $O_u(t)$ rather than of $t$ and $\mathcal{D}$ directly, a policy that generalizes must be a function of \emph{features} of the neighbourhood, which is precisely what makes an inductive, size-agnostic parameterization the right hypothesis class.
+
+\section{GLIDER}\label{sec:method}
+
+\subsection{Reduction to cost-to-go estimation}
+Fix an epoch and let $c(u,v)=L_{(u,v)}(\lambda_{(u,v)})>0$ be the realized cost of edge $(u,v)$, observable locally from the interface queue. Define the cost-to-go
+\begin{equation}
+Q^\star(v,d)=\min_{\text{paths } v\rightsquigarrow d}\ \sum_{e\in\text{path}} c(e),
+\label{eq:ctg}
+\end{equation}
+and the greedy policy induced by an estimate $\hat{Q}$,
+\begin{equation}
+\pi_{\hat{Q}}(u,d)=\arg\min_{v\in\mathcal{N}(u)}\ \big[\,c(u,v)+\hat{Q}(v,d)\,\big].
+\label{eq:greedy}
+\end{equation}
+Note $\pi_{\hat Q}\in\Pi_{\mathrm{loc}}$: it reads only $u$'s incident edge costs and the estimates at $u$'s neighbours. The next two results say that within this class, estimating $Q^\star$ is the whole problem, and they tell us what error metric matters.
+
+\begin{lemma}[Exact consistency]\label{lem:exact}
+If $\hat{Q}=Q^\star$ and $c(e)>0$ for all $e$, then for every $(u,d)$ with $d$ reachable from $u$, the greedy policy~\eqref{eq:greedy} routes $u$ to $d$ along a minimum-cost path, and the induced path is simple.
+\end{lemma}
+\begin{proof}
+By Bellman optimality, $Q^\star(u,d)=\min_{v\in\mathcal{N}(u)}[c(u,v)+Q^\star(v,d)]$, so the greedy successor $v$ satisfies $Q^\star(u,d)=c(u,v)+Q^\star(v,d)$ and lies on a minimum-cost path. Since $c(u,v)>0$, we get $Q^\star(v,d)=Q^\star(u,d)-c(u,v)<Q^\star(u,d)$, so $Q^\star(\cdot,d)$ strictly decreases along the walk. A strictly decreasing potential cannot revisit a node, hence the walk is simple, and as $Q^\star$ decreases by at least $\min_e c(e)>0$ per hop it reaches $Q^\star=0$, i.e.\ $d$, in finitely many hops.
+\end{proof}
+
+\begin{proposition}[$\varepsilon$-approximation]\label{prop:approx}
+Suppose $\lVert\hat{Q}-Q^\star\rVert_\infty\le\varepsilon$ and greedy forwarding~\eqref{eq:greedy} delivers a packet from $u$ to $d$ in $H$ hops. Then the realized path cost satisfies
+\begin{equation}
+\mathrm{cost}(u\rightsquigarrow d)\ \le\ Q^\star(u,d)\ +\ 2\varepsilon H .
+\end{equation}
+\end{proposition}
+\begin{proof}
+Let $u_0=u,\dots,u_H=d$ be the greedy walk and let $v^\ast_i$ be an optimal successor of $u_i$. Greediness on $\hat{Q}$ gives $c(u_i,u_{i+1})+\hat{Q}(u_{i+1},d)\le c(u_i,v^\ast_i)+\hat{Q}(v^\ast_i,d)$. Using $\lvert\hat{Q}-Q^\star\rvert\le\varepsilon$ on both sides and Bellman optimality $c(u_i,v^\ast_i)+Q^\star(v^\ast_i,d)=Q^\star(u_i,d)$,
+\[
+c(u_i,u_{i+1})+Q^\star(u_{i+1},d)\ \le\ Q^\star(u_i,d)+2\varepsilon .
+\]
+Summing over $i=0,\dots,H-1$ telescopes the $Q^\star$ terms and, with $Q^\star(d,d)=0$, yields $\sum_i c(u_i,u_{i+1})\le Q^\star(u,d)+2\varepsilon H$.
+\end{proof}
+
+\begin{corollary}[Ranking, not regression]\label{cor:rank}
+At node $u$ let $\Delta(u,d)$ be the gap in $c(u,v)+Q^\star(v,d)$ between the best and the second-best neighbour. The greedy decision at $u$ is guaranteed correct only if $\Delta(u,d)>2\varepsilon$. Hence an estimator should be trained to order neighbours correctly at the decision boundary, and reducing mean regression error is useful only insofar as it reduces $\varepsilon$ below the local gaps.
+\end{corollary}
+
+Corollary~\ref{cor:rank} is not a technicality: in our constellations $\Delta$ is on the order of a few milliseconds, being a difference of one-hop propagation costs, whereas an estimator trained purely to regress~\eqref{eq:ctg} plateaus at an $\varepsilon$ of several milliseconds. The bound then predicts, and Section~\ref{sec:results} confirms, that pure regression yields long wandering paths. This is what motivates the training objective below.
+
+\subsection{Inductive estimator}
+GLIDER embeds every node with $K$ rounds of message passing on the bidirectional snapshot graph. Node features are normalized and size agnostic: scaled position, a satellite/ground-station indicator, the mean utilization of outgoing links (the locally observable congestion signal), normalized out-degree, and the sine/cosine of the satellite's fractional plane and slot coordinates, which are structural, always known on board, and independent of constellation size. Edge features are normalized propagation delay, utilization and capacity. Layer $k$ computes
+\begin{align}
+m^{(k)}_{uv}&=\phi\big(h^{(k)}_u,h^{(k)}_v,x_{uv}\big),\quad
+a^{(k)}_v=\tfrac{1}{|\mathcal{I}(v)|}\!\!\sum_{u\in\mathcal{I}(v)}\!\! m^{(k)}_{uv},\nonumber\\
+h^{(k+1)}_v&=\mathrm{GRU}\big(h^{(k)}_v,a^{(k)}_v\big),
+\end{align}
+with mean aggregation so embeddings stay comparable across constellations of different degree distribution. The destination-conditioned readout returns a non-negative estimate from the two node embeddings and an explicit geometric term $g(v,d)$, the normalized straight-line distance, so the model need not rediscover Euclidean progress:
+\begin{equation}
+Q_\theta(v,d)=\mathrm{softplus}\big(\psi(h^{(K)}_v,h^{(K)}_d,g(v,d))\big).
+\end{equation}
+Since $\phi,\psi$ and the recurrence are shared across nodes and independent of $N$, one trained $\theta$ applies to any constellation. Because $Q^\star$ is a global quantity, $K$ must be large enough for information to propagate: we take $K$ on the order of the routing diameter.
+
+\subsection{Supervision: the reference and the objective}\label{sec:caglobal}
+\textbf{CA-Global.} We obtain targets from a centralized congestion-aware routing that alternates (i) recomputing edge costs from the current load via~\eqref{eq:link} and (ii) rerouting all demand on the resulting shortest paths, damping the load update by the method of successive averages until it converges to a load-balanced equilibrium satisfying~\eqref{eq:c1}--\eqref{eq:c3}. Its converged cost-to-go, one reverse-Dijkstra tree per destination, is $Q^\star$ in~\eqref{eq:ctg}. CA-Global needs global state and many iterations, so it is not in $\Pi_{\mathrm{loc}}$; it is an offline teacher and an upper reference at test time.
+
+\textbf{Objective.} Guided by Corollary~\ref{cor:rank}, we train the decision, not the value. For each $(u,d)$ we score $u$'s neighbours by $-(c(u,v)+Q_\theta(v,d))/T$ and apply cross-entropy toward the neighbour CA-Global selects, with temperature $T$ and the observed cost clipped so that a single saturated neighbour cannot dominate the softmax. A cost-to-go regression term is retained with a small weight as shaping:
+\begin{equation}
+\mathcal{L}(\theta)=\underbrace{\mathbb{E}\big[\mathrm{CE}\big]}_{\text{next-hop imitation}}\;+\;\alpha\,\underbrace{\mathbb{E}\big[\mathrm{smooth}L_1(Q_\theta,Q^\star)\big]}_{\text{shaping}} .
+\end{equation}
+Features are built from the load a router actually observes under naive routing, so the model learns to map \emph{observable} congestion to the balanced cost-to-go.
+
+\subsection{Loop-free distributed forwarding}
+To satisfy~\eqref{eq:c4} under an approximate estimate, where Lemma~\ref{lem:exact}'s strict-decrease argument no longer holds, each packet carries a short record of visited nodes. At $u$ it moves to the unvisited neighbour minimizing~\eqref{eq:greedy}, deflecting to the next-best neighbour if the greedy choice was already visited, and is declared undelivered only at a genuine dead end. Paths are then simple by construction, with no global coordination. A decision requires the embeddings of $u$'s neighbours, exchanged locally once per snapshot, and the destination embedding, shared for the small set of ground-station destinations, so the per-hop cost is $O(\lvert\mathcal{N}(u)\rvert)$, independent of $N$.
+
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}[
+  sat/.style={circle,draw=blue!60,fill=blue!12,minimum size=5.5mm,inner sep=0,font=\scriptsize},
+  gs/.style={rectangle,draw=orange!70,fill=orange!15,minimum size=5mm,inner sep=1pt,font=\scriptsize},
+  isl/.style={-,gray!60,thin},
+  chosen/.style={-{Latex[length=2mm]},red!70!black,very thick},
+  cand/.style={-{Latex[length=1.6mm]},blue!45,thick,dashed},
+  ]
+  \foreach \x in {0,1,2,3} \foreach \y in {0,1,2} {
+     \node[sat] (s\x\y) at (1.15*\x,1.0*\y) {};
+  }
+  \foreach \x in {0,1,2,3} \foreach \y in {0,1} {\draw[isl] (s\x\y)--(s\x\the\numexpr\y+1\relax);}
+  \foreach \x in {0,1,2} \foreach \y in {0,1,2} {\draw[isl] (s\x\y)--(s\the\numexpr\x+1\relax\y);}
+  \node[gs] (src) at (-0.9,1.0) {src};
+  \node[gs] (dst) at (4.6,1.0) {dst};
+  \draw[isl] (src)--(s00); \draw[isl] (src)--(s01);
+  \draw[isl] (dst)--(s31); \draw[isl] (dst)--(s32);
+  \node[sat,draw=red!70!black,fill=red!12] (u) at (1.15,1.0) {$u$};
+  \draw[cand] (u)--(s21) node[midway,above,font=\tiny]{$c{+}Q$};
+  \draw[cand] (u)--(s10);
+  \draw[chosen] (u)--(s12);
+  \node[font=\tiny,red!70!black] at (1.15,2.35) {chosen: $\min_v c(u,v){+}Q(v,d)$};
+\end{tikzpicture}
+\caption{GLIDER forwarding. Node $u$ ranks its neighbours by observed link cost
+$c(u,v)$ plus estimated congestion-aware cost-to-go $Q(v,d)$ and forwards to the
+minimizer, deflecting around saturated links using only local state.}
+\label{fig:overview}
+\end{figure}
+
+\section{Experimental Setup}\label{sec:setup}
+\textbf{Simulator and constellations.} We use the self-contained LEO simulator of Section~\ref{sec:problem} with a Hypatia-compatible $+$Grid model. Training uses a \emph{medium} constellation (24 planes $\times$ 16 satellites, 550~km, $53^\circ$). Generalization is tested zero shot on \emph{Starlink-like} (72$\times$22, 550~km, $53^\circ$), \emph{Kuiper-like} (34$\times$34, 630~km, $51.9^\circ$) and a \emph{Telesat-like} polar shell (27$\times$13, 1015~km, $99^\circ$). ISL capacity is 20~Gbps; ground links are provisioned so that ISLs, where routing decisions are made, are the bottleneck.
+
+\textbf{Methods.} \emph{SP}: shortest path on propagation delay, the congestion-oblivious deployed rule, in $\Pi_{\mathrm{loc}}$. \emph{CA-Global}: the centralized reference of Section~\ref{sec:caglobal}, not in $\Pi_{\mathrm{loc}}$; it upper-bounds what a distributed policy can recover. \emph{GLIDER}: our learned policy in $\Pi_{\mathrm{loc}}$. \emph{GLIDER-noMP}: ablation with message passing removed (a per-node MLP on the same features and geometric term, widened to match parameters), which isolates the graph structure.
+
+\textbf{Protocol.} Every model is trained independently for each of three seeds. For each trained model we average each metric over the evaluation scenarios; tables and figures then report the mean and standard deviation of those per-seed means \emph{across seeds}, so the error bars measure variability across independently trained models. Scenario sampling uses a fixed held-out seed, identical for all methods, so all methods see the same instances. SP and CA-Global do not depend on the model and therefore have zero spread across seeds by construction.
+
+\textbf{Metrics.} Carried demand fraction (share of offered load delivered on paths with all $\rho_e<1$, i.e.\ satisfying~\eqref{eq:c2}), peak link utilization $\max_e\rho_e$, 95th-percentile flow latency over delivered demand, and mean path length.
+
+\textbf{Training.} Demand levels span light to overloaded and scenarios include up to 12\% ISL failures, so the model sees churn during training. All experiments run on a single NVIDIA RTX 4090; scenario labelling runs on CPU and the model on GPU.
+
+\section{Results}\label{sec:results}
+All numbers below are produced directly from the released pipeline's CSV logs; no value is transcribed by hand.
+
+\textbf{The opportunity a distributed policy can target.} Table~\ref{tab:main} reports the training constellation under heavy, skewed demand. Congestion-oblivious SP saturates the geodesic links and leaves demand undelivered; CA-Global, solving P1 with global state, spreads load, lowers $\max_e\rho_e$ and carries more. The gap between the two is the capacity that a policy in $\Pi_{\mathrm{loc}}$ can hope to recover, and it is the quantity against which GLIDER must be judged.
+
+\begin{table}[t]
+\centering
+\caption{In-distribution routing on the \emph{medium} constellation under heavy skewed demand. Mean $\pm$ std across independently trained seeds. CA-Global is centralized (not in $\Pi_{\mathrm{loc}}$) and bounds what a distributed policy can recover.}
+\label{tab:main}
+\small
+\input{tables/main.tex}
+\end{table}
+
+\textbf{Ranking versus regression.} Consistent with Corollary~\ref{cor:rank}, training $Q_\theta$ by cost-to-go regression alone yields an $\varepsilon$ of several milliseconds against per-hop decision gaps of a few milliseconds, and the greedy walk wanders, inflating path length far beyond the shortest-path envelope. Replacing the objective with the temperature-scaled next-hop imitation loss removes the pathology and restores sane path lengths, and carried demand then improves monotonically as the receptive field $K$ grows toward the routing diameter. Fig.~\ref{fig:train} shows the next-hop cross-entropy and the shaping loss across seeds.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=0.98\linewidth]{figs/training.pdf}
+\caption{Training curves across seeds. The next-hop cross-entropy, which by Corollary~\ref{cor:rank} governs the decision, is the objective that matters; the cost-to-go loss is shaping only.}
+\label{fig:train}
+\end{figure}
+
+\textbf{Zero-shot cross-constellation transfer.} The same trained model, never retrained, is applied to Starlink-like and Kuiper-like shells with roughly $2$--$4\times$ more satellites, and to a polar Telesat-like shell whose inclination and ISL cut-off differ. The forwarding rule and features are identical; only the snapshot graph changes. Table~\ref{tab:gen} and Fig.~\ref{fig:gen} report carried demand in each case. This is the property that makes one model usable across the shells an operator actually flies.
+
+\begin{table}[t]
+\centering
+\caption{Zero-shot transfer: carried demand fraction, mean $\pm$ std across seeds. GLIDER is trained only on \emph{Medium}.}
+\label{tab:gen}
+\small
+\input{tables/generalization.tex}
+\end{table}
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=0.95\linewidth]{figs/generalization.pdf}
+\caption{Carried demand on the training constellation and zero shot on unseen shells.}
+\label{fig:gen}
+\end{figure}
+
+\textbf{Robustness to link churn.} We fail a fraction of ISLs uniformly at random at test time. Failed links simply change the snapshot graph the estimator runs on, and loop-free deflection routes around dead ends, so no re-training or re-solve is required. Table~\ref{tab:fail} and Fig.~\ref{fig:fail} track carried demand as the failure rate rises to 20\%.
+
+\begin{table}[t]
+\centering
+\caption{Robustness to ISL failures on the Starlink-like shell: carried demand fraction, mean $\pm$ std across seeds.}
+\label{tab:fail}
+\small
+\input{tables/failure.tex}
+\end{table}
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=0.85\linewidth]{figs/failure.pdf}
+\caption{Carried demand versus ISL failure rate.}
+\label{fig:fail}
+\end{figure}
+
+\textbf{Ablation.} GLIDER-noMP, a per-node MLP over the same features with a matched parameter budget, is reported in the last row of Table~\ref{tab:main}. A per-node view cannot see the downstream congestion or the topological direction toward the destination that determine whether a neighbour is a good next hop, which isolates the graph structure, rather than raw capacity, as the source of the learned policy's routing ability.
+
+\section{Limitations}
+The evaluation uses a flow-level M/M/1 delay model, not a packet-level simulation with TCP control loops, so absolute latencies should be read as a routing-quality signal rather than a protocol-level prediction. CA-Global converges to a load-balanced equilibrium of P1 rather than a certified global optimum, so it is a strong reference and not a true bound. Proposition~\ref{prop:approx} is a worst-case bound and is loose when the estimate errs in a direction consistent across neighbours. Finally, equal-cost shortest paths on the $+$Grid put a benign floor on next-hop imitation, since the teacher's tie-break is arbitrary and unlearnable; exploiting ties explicitly, rather than imitating one arbitrarily, is the most promising next step for tightening the learned policy. The released simulator is structured so that the reference, the delay model and the teacher can each be swapped.
+
+\section{Conclusion}
+We formalized distributed congestion-aware LEO routing with an explicit information constraint, and showed that within the greedy policy class it reduces to estimating a congestion-aware cost-to-go, with an exactness lemma and an $\varepsilon$-approximation bound that dictate a ranking objective rather than a regression one. GLIDER realizes that estimator inductively, so a single trained model transfers zero shot across constellation geometries and tolerates link churn while deciding from local state alone. We release the full pipeline so the opportunity we quantify, and the distributed policy that targets it, can be reproduced and improved at scale.
+
+\bibliographystyle{IEEEtran}
+\bibliography{refs}
+
+\end{document}

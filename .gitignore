@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+.pytest_cache/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+
+# Experiment outputs
+code/runs/
+code/results/
+code/_anchor_run.py
+code/runs_anchor*.log
+*.pt
+
+# LaTeX build artefacts
+paper/*.aux
+paper/*.log
+paper/*.out
+paper/*.bbl
+paper/*.blg
+paper/*.fls
+paper/*.fdb_latexmk
+paper/*.synctex.gz
+paper/main.pdf
+
+# OS
+.DS_Store
+Thumbs.db

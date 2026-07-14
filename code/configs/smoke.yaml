@@ -1,0 +1,33 @@
+# Tiny configuration for smoke tests (runs in seconds on CPU).
+run_name: smoke
+seed: 0
+device: auto
+steps: 30
+lr: 1.0e-3
+hidden: 32
+num_layers: 3
+use_messages: true
+eval_every: 15
+eval_scenarios: 3
+max_pairs_per_dest: 24
+log_every: 10
+
+scenario:
+  presets: [tiny]
+  n_ground_stations: 6
+  epoch_max_s: 5600.0
+  load_min: 0.7
+  load_max: 1.4
+  failure_min: 0.0
+  failure_max: 0.10
+  ca_iters: 8
+  traffic_base_gbps: 30.0
+  net:
+    isl_capacity_gbps: 20.0
+    gsl_capacity_gbps: 80.0
+    min_elevation_deg: 10.0
+    per_hop_overhead_ms: 0.0
+  queue:
+    packet_bits: 12000.0
+    queue_delay_scale: 50.0
+    max_hops: 64
