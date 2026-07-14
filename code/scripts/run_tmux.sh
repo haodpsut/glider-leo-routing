@@ -1,0 +1,75 @@
+#!/usr/bin/env bash
+# Launch the full experiment inside a detached tmux session, so it survives SSH drops.
+#
+#   bash scripts/run_tmux.sh                 # start (or attach to) the run
+#   bash scripts/run_tmux.sh --attach        # just attach to the running session
+#   bash scripts/run_tmux.sh --status        # print progress without attaching
+#   bash scripts/run_tmux.sh --kill          # stop the run
+#
+# Env vars are passed through to run_full.sh, e.g.
+#   SEEDS="1 2 3 4 5" N_EVAL=100 bash scripts/run_tmux.sh
+#
+# The session runs three panes: the experiment, a live log tail, and nvidia-smi.
+set -euo pipefail
+
+CODE_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+SESSION="${SESSION:-glider}"
+ENV_NAME="${ENV_NAME:-glider}"
+SEEDS="${SEEDS:-1 2 3}"
+N_EVAL="${N_EVAL:-50}"
+LOG_DIR="${CODE_DIR}/logs"
+LOG_FILE="${LOG_DIR}/run_$(date +%Y%m%d_%H%M%S).log"
+LATEST="${LOG_DIR}/latest.log"
+
+command -v tmux >/dev/null 2>&1 || { echo "error: tmux not installed (sudo apt install tmux)"; exit 1; }
+
+case "${1:-}" in
+  --attach) exec tmux attach -t "${SESSION}" ;;
+  --kill)
+      tmux kill-session -t "${SESSION}" 2>/dev/null && echo "killed session '${SESSION}'" \
+        || echo "no session '${SESSION}'"
+      exit 0 ;;
+  --status)
+      if [ -f "${LATEST}" ]; then
+        echo "=== last 20 lines of ${LATEST} ==="
+        tail -20 "${LATEST}"
+      else
+        echo "no log yet at ${LATEST}"
+      fi
+      tmux has-session -t "${SESSION}" 2>/dev/null \
+        && echo "=== session '${SESSION}' is RUNNING ===" \
+        || echo "=== session '${SESSION}' is not running ==="
+      exit 0 ;;
+esac
+
+if tmux has-session -t "${SESSION}" 2>/dev/null; then
+  echo "session '${SESSION}' already running; attaching. (--kill to stop it)"
+  exec tmux attach -t "${SESSION}"
+fi
+
+mkdir -p "${LOG_DIR}"
+ln -sf "${LOG_FILE}" "${LATEST}"
+
+# The experiment command. `conda run` avoids needing an interactive shell hook, and
+# `stdbuf -oL` keeps the log line-buffered so --status shows live progress.
+RUN_CMD="cd '${CODE_DIR}' && \
+SEEDS='${SEEDS}' N_EVAL='${N_EVAL}' \
+stdbuf -oL -eL conda run --no-capture-output -n '${ENV_NAME}' \
+bash scripts/run_full.sh 2>&1 | tee '${LOG_FILE}'; \
+echo; echo '=== run finished (exit=\$?) ==='; echo 'Press any key to close.'; read -n 1"
+
+tmux new-session  -d -s "${SESSION}" -n run "${RUN_CMD}"
+tmux split-window -t "${SESSION}:run" -v "tail -f '${LOG_FILE}'"
+tmux split-window -t "${SESSION}:run" -h "watch -n 5 nvidia-smi"
+tmux select-layout -t "${SESSION}:run" main-horizontal
+tmux select-pane   -t "${SESSION}:run.0"
+
+echo "started tmux session '${SESSION}'"
+echo "  log      : ${LOG_FILE}"
+echo "  attach   : tmux attach -t ${SESSION}     (detach with Ctrl-b then d)"
+echo "  status   : bash scripts/run_tmux.sh --status"
+echo "  stop     : bash scripts/run_tmux.sh --kill"
+echo
+echo "Attaching in 2s (Ctrl-b d to detach and leave it running)..."
+sleep 2
+exec tmux attach -t "${SESSION}"

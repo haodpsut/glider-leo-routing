@@ -9,6 +9,7 @@ venv/
 # Experiment outputs
 code/runs/
 code/results/
+code/logs/
 code/_anchor_run.py
 code/runs_anchor*.log
 *.pt

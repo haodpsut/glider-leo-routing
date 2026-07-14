@@ -24,7 +24,7 @@ infocom-conf/
 ## Status (read before submitting)
 
 The simulator, baselines, training/eval pipeline, and tests are complete and green
-(21 tests). The **SP-vs-CA-Global opportunity is real and reproducible**: under
+(24 tests). The **SP-vs-CA-Global opportunity is real and reproducible**: under
 skewed demand the centralized congestion-aware reference delivers about ten points
 more carried demand than shortest path at lower peak utilization.
 
@@ -53,37 +53,77 @@ preliminary and must be regenerated.
   that keeps the whole pipeline reproducible on a single GPU. See the paper's
   limitations section.
 
-## Setup (RTX 4090 host, Ubuntu)
+## Setup (RTX 4090 host, Ubuntu + conda)
+
+```bash
+git clone https://github.com/haodpsut/glider-leo-routing.git
+cd glider-leo-routing
+bash code/scripts/setup_conda.sh     # creates env 'glider', checks the GPU, runs tests
+conda activate glider
+```
+
+`setup_conda.sh` is idempotent: re-running it updates the environment in place. It
+installs PyTorch with a bundled CUDA 12.1 runtime from the `pytorch`/`nvidia`
+channels, so **no system CUDA toolkit is needed**, only a recent NVIDIA driver. If
+your driver is too old, change `pytorch-cuda=12.1` to `11.8` in
+[`environment.yml`](environment.yml). The script prints `cuda avail` and the GPU
+name; if it says CUDA is not visible, check `nvidia-smi` before running anything.
+
+Manual equivalent, if you prefer:
+
+```bash
+conda env create -f environment.yml && conda activate glider
+python -c "import torch; print(torch.__version__, torch.cuda.is_available(), torch.cuda.get_device_name(0))"
+```
+
+<details>
+<summary>Alternative: plain venv + pip (no conda)</summary>
 
 ```bash
 cd code
 python -m venv .venv && source .venv/bin/activate
 pip install --upgrade pip
-# Install a CUDA build of PyTorch matching your driver, e.g. CUDA 12.1:
 pip install torch --index-url https://download.pytorch.org/whl/cu121
 pip install -r requirements.txt
 ```
+</details>
 
-Verify the GPU is visible:
-
-```bash
-python -c "import torch; print(torch.__version__, torch.cuda.is_available(), torch.cuda.get_device_name(0))"
-```
-
-## Smoke test (seconds, CPU or GPU)
+## Smoke test (seconds)
 
 ```bash
-cd code
-pytest -q                 # 21 unit + end-to-end tests
+conda activate glider && cd code
+pytest -q                 # 24 unit + end-to-end tests
 bash scripts/run_smoke.sh # tiny constellation, trains a few dozen steps, evaluates
 ```
 
 ## Full experiments (paper numbers)
 
+The run takes hours, so drive it from **tmux** and it survives an SSH drop:
+
+```bash
+conda activate glider && cd code
+bash scripts/run_tmux.sh                       # start, then Ctrl-b d to detach
+SEEDS="1 2 3 4 5" N_EVAL=100 bash scripts/run_tmux.sh   # bigger budget
+```
+
+The session opens three panes: the experiment, a live log tail, and `nvidia-smi`.
+It activates the conda env for you and tees everything to `code/logs/`.
+
+```bash
+bash scripts/run_tmux.sh --status   # progress, without attaching
+bash scripts/run_tmux.sh --attach   # reattach after an SSH drop
+bash scripts/run_tmux.sh --kill     # stop the run
+tail -f code/logs/latest.log        # or just watch the log
+```
+
+<details>
+<summary>Foreground equivalent (no tmux)</summary>
+
 ```bash
 cd code
 SEEDS="1 2 3" bash scripts/run_full.sh
 ```
+</details>
 
 For **each seed** this trains GLIDER and the no-message-passing ablation from
 scratch on the `medium` constellation, then evaluates that model in-distribution and
@@ -118,15 +158,18 @@ Override the budget with env vars, e.g. `SEEDS="1 2 3 4 5" N_EVAL=100 bash scrip
 ## Reproducing individual pieces
 
 ```bash
-# Train only
-python -m glider.train --config configs/main.yaml --out runs/main
+conda activate glider && cd code
+
+# Train one seed
+python -m glider.train --config configs/main.yaml --seed 1 --out runs/main_s1
 
 # Evaluate a checkpoint on a specific constellation
-python -m glider.evaluate --config configs/main.yaml --ckpt runs/main/glider.pt \
-    --presets kuiper_shell --n 50 --seed 1 --out results/kuiper.csv
+python -m glider.evaluate --config configs/main.yaml --ckpt runs/main_s1/glider.pt \
+    --presets kuiper_shell --n 50 --seed 1000 --run-seed 1 --out results/kuiper_s1.csv
 
-# Build figures from whatever CSVs exist
-python scripts/make_figures.py --results results --out ../paper/figs
+# Regenerate tables + figures from whatever CSVs exist
+python scripts/make_tables.py  --results results --out ../paper/tables
+python scripts/make_figures.py --results results --runs runs --out ../paper/figs
 ```
 
 ## Building the paper
@@ -135,3 +178,17 @@ python scripts/make_figures.py --results results --out ../paper/figs
 cd paper
 latexmk -pdf main.tex     # or: pdflatex main.tex && bibtex main && pdflatex ... x2
 ```
+
+Tables and figures are `\input`/`\includegraphics`-ed from generated files, so after
+an experiment run you only need to rebuild.
+
+## Troubleshooting
+
+| Symptom | Fix |
+| --- | --- |
+| `setup_conda.sh` prints `cuda avail : False` | Check `nvidia-smi`. If the driver predates CUDA 12.1, set `pytorch-cuda=11.8` in `environment.yml` and re-run the script. |
+| `conda: command not found` | Install Miniconda, then `source ~/miniconda3/etc/profile.d/conda.sh`. |
+| `CondaError: Run 'conda init'` inside tmux | Not needed: `run_tmux.sh` uses `conda run`, which does not require a shell hook. |
+| Training feels slow, GPU is idle in `nvidia-smi` | Expected in bursts: scenario labelling (CA-Global, iterative Dijkstra) is **CPU**-bound; the GPU only runs the model. Lower `scenario.ca_iters` or `scenario.n_ground_stations` in the config to speed up labelling. |
+| SSH dropped mid-run | Nothing is lost. `bash scripts/run_tmux.sh --attach`. |
+| Want to resume after a crash | Per-seed checkpoints live in `runs/main_s<seed>/`; re-running `run_full.sh` retrains from scratch, so move or delete `runs/` first if you want a clean slate. |
