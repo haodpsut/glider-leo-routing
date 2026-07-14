@@ -17,6 +17,9 @@ SESSION="${SESSION:-glider}"
 ENV_NAME="${ENV_NAME:-glider}"
 SEEDS="${SEEDS:-1 2 3}"
 N_EVAL="${N_EVAL:-50}"
+# On a multi-GPU host, pin the run to one device, e.g. CUDA_VISIBLE_DEVICES=1.
+# Empty means "use whatever torch picks" (device 0).
+CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-}"
 LOG_DIR="${CODE_DIR}/logs"
 LOG_FILE="${LOG_DIR}/run_$(date +%Y%m%d_%H%M%S).log"
 LATEST="${LOG_DIR}/latest.log"
@@ -47,13 +50,43 @@ if tmux has-session -t "${SESSION}" 2>/dev/null; then
   exec tmux attach -t "${SESSION}"
 fi
 
+# Fail fast, and in the terminal the user is looking at, rather than inside a tmux
+# pane the user has to hunt for. A missing env is the single most common cause of a
+# run that dies seconds after launch.
+if ! command -v conda >/dev/null 2>&1; then
+  echo "error: conda not found on PATH. Run: bash scripts/setup_conda.sh"
+  exit 1
+fi
+if ! conda env list | awk '{print $1}' | grep -qx "${ENV_NAME}"; then
+  echo "error: conda environment '${ENV_NAME}' does not exist."
+  echo
+  echo "Create it first (this also verifies the GPU and runs the tests):"
+  echo "    bash scripts/setup_conda.sh"
+  echo
+  echo "Existing environments:"
+  conda env list | sed 's/^/    /'
+  exit 1
+fi
+
+# A full disk silently breaks training runs hours in. Warn before burning GPU time.
+AVAIL_GB=$(df -BG --output=avail . 2>/dev/null | tail -1 | tr -dc '0-9')
+if [ -n "${AVAIL_GB}" ] && [ "${AVAIL_GB}" -lt 5 ]; then
+  echo "warning: only ${AVAIL_GB}GB free on this filesystem."
+  echo "         Checkpoints and logs may fail to write. Free space first:"
+  echo "             conda clean --all -y"
+  echo
+  printf "Continue anyway? [y/N] "
+  read -r reply
+  case "${reply}" in [yY]*) ;; *) echo "aborted."; exit 1 ;; esac
+fi
+
 mkdir -p "${LOG_DIR}"
 ln -sf "${LOG_FILE}" "${LATEST}"
 
 # The experiment command. `conda run` avoids needing an interactive shell hook, and
 # `stdbuf -oL` keeps the log line-buffered so --status shows live progress.
 RUN_CMD="cd '${CODE_DIR}' && \
-SEEDS='${SEEDS}' N_EVAL='${N_EVAL}' \
+SEEDS='${SEEDS}' N_EVAL='${N_EVAL}' CUDA_VISIBLE_DEVICES='${CUDA_VISIBLE_DEVICES}' \
 stdbuf -oL -eL conda run --no-capture-output -n '${ENV_NAME}' \
 bash scripts/run_full.sh 2>&1 | tee '${LOG_FILE}'; \
 echo; echo '=== run finished (exit=\$?) ==='; echo 'Press any key to close.'; read -n 1"
