@@ -10,7 +10,10 @@
 #   SEEDS="1 2 3 4 5" N_EVAL=100 bash scripts/run_tmux.sh
 #
 # The session runs three panes: the experiment, a live log tail, and nvidia-smi.
-set -euo pipefail
+#
+# `set -u` is deliberately omitted: `conda` is a shell function whose activation
+# hooks reference unbound variables, so nounset would abort us on any conda call.
+set -eo pipefail
 
 CODE_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 SESSION="${SESSION:-glider}"
