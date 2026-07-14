@@ -73,12 +73,19 @@ def test_tables_written(tmp_path):
     results = tmp_path / "results"
     results.mkdir()
     for seed in [1, 2]:
-        rows = [_row("glider", seed, 0.8, 0), _row("sp", seed, 0.75, 0),
-                _row("ca_global", seed, 0.85, 0)]
-        _write_csv(results / f"main_medium_s{seed}.csv", rows)
+        rows = [_row(m, seed, c, 0) for m, c in [
+            ("sp", 0.62), ("deflect_local", 0.72), ("glider", 0.80),
+            ("deflect_oracle", 0.89), ("ca_global", 0.93),
+        ]]
+        _write_csv(results / f"main_starlink_shell1_s{seed}.csv", rows)
+        _write_csv(results / f"nomp_starlink_shell1_s{seed}.csv",
+                   [_row("glider", seed, 0.66, 0)])
     out = tmp_path / "tables"
     make_tables.table_main(str(results), str(out))
     make_tables.table_generalization(str(results), str(out))
     text = (out / "main.tex").read_text(encoding="utf-8")
-    assert "\\begin{tabular}" in text and "GLIDER" in text
+    # Every method the paper compares must appear, including the two that make or
+    # break the claim: the zero-learning baseline and the ceiling.
+    for needle in ["GLIDER", "Deflect-Local", "Deflect-Oracle"]:
+        assert needle in text
     assert (out / "generalization.tex").exists()

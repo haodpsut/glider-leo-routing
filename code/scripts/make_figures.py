@@ -20,8 +20,20 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 
-METHOD_LABEL = {"sp": "Shortest-path", "ca_global": "CA-Global", "glider": "GLIDER"}
-METHOD_COLOR = {"sp": "#888888", "ca_global": "#1f4e79", "glider": "#c0504d"}
+METHOD_LABEL = {
+    "sp": "Shortest-path",
+    "deflect_local": "Deflect-Local (no learning)",
+    "ca_global": "CA-Global",
+    "deflect_oracle": "Deflect-Oracle (ceiling)",
+    "glider": "GLIDER",
+}
+METHOD_COLOR = {
+    "sp": "#888888",
+    "deflect_local": "#e8a33d",
+    "ca_global": "#4a4a4a",
+    "deflect_oracle": "#2e8b57",
+    "glider": "#c0504d",
+}
 
 
 def read_csv(path: str) -> dict[str, list[dict]]:
@@ -39,10 +51,10 @@ def _mean(rows: list[dict], key: str) -> float:
 
 
 CONSTEL_LABEL = {
-    "medium": "Medium\n(train)",
-    "starlink_shell1": "Starlink-like",
+    "starlink_shell1": "Starlink-like\n(train)",
     "kuiper_shell": "Kuiper-like",
     "telesat_polar": "Telesat-like",
+    "medium": "Medium",
 }
 
 
@@ -63,8 +75,8 @@ def _seed_means(paths: list[str], method: str, metric: str) -> list[float]:
 
 def fig_generalization(results_dir: str, out_dir: str) -> None:
     """Grouped bars: carried fraction per constellation. Error bars = std across seeds."""
-    constels = ["medium", "starlink_shell1", "kuiper_shell", "telesat_polar"]
-    methods = ["sp", "ca_global", "glider"]
+    constels = ["starlink_shell1", "kuiper_shell", "telesat_polar", "medium"]
+    methods = ["sp", "deflect_local", "glider", "deflect_oracle"]
     data: dict[str, dict[str, list[float]]] = {c: {} for c in constels}
     for c in constels:
         paths = glob.glob(os.path.join(results_dir, f"main_{c}_s*.csv"))
@@ -74,12 +86,13 @@ def fig_generalization(results_dir: str, out_dir: str) -> None:
     if not present:
         return
     x = np.arange(len(present))
-    w = 0.26
-    fig, ax = plt.subplots(figsize=(6.6, 3.2))
+    w = 0.20
+    fig, ax = plt.subplots(figsize=(7.2, 3.2))
+    off = (len(methods) - 1) / 2.0
     for i, m in enumerate(methods):
         means = [np.mean(data[c][m]) if data[c][m] else 0.0 for c in present]
         errs = [np.std(data[c][m]) if len(data[c][m]) > 1 else 0.0 for c in present]
-        ax.bar(x + (i - 1) * w, means, w, yerr=errs, capsize=3,
+        ax.bar(x + (i - off) * w, means, w, yerr=errs, capsize=2,
                label=METHOD_LABEL[m], color=METHOD_COLOR[m])
     ax.set_xticks(x)
     ax.set_xticklabels([CONSTEL_LABEL.get(c, c) for c in present], fontsize=8)
@@ -96,7 +109,7 @@ def fig_generalization(results_dir: str, out_dir: str) -> None:
 
 def fig_failure(results_dir: str, out_dir: str) -> None:
     """Carried fraction vs ISL failure rate, with std-across-seeds error bars."""
-    methods = ["sp", "ca_global", "glider"]
+    methods = ["sp", "deflect_local", "glider", "deflect_oracle"]
     fracs = sorted({
         os.path.basename(p).split("_")[1]
         for p in glob.glob(os.path.join(results_dir, "failure_*_s*.csv"))

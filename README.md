@@ -23,21 +23,36 @@ infocom-conf/
 
 ## Status (read before submitting)
 
-The simulator, baselines, training/eval pipeline, and tests are complete and green
-(24 tests). The **SP-vs-CA-Global opportunity is real and reproducible**: under
-skewed demand the centralized congestion-aware reference delivers about ten points
-more carried demand than shortest path at lower peak utilization.
+The simulator, baselines, deflection routing, training/eval pipeline, and tests are
+complete and green (28 tests). Two things are solid and reproducible:
 
-The **learned GLIDER policy is not yet competitive at the small CPU "anchor"
-budget** used during development. Fixing the training objective (adding the
-temperature-scaled next-hop imitation loss) and deepening the network moved carried
-demand from ~0.18 to ~0.77 of shortest path's level on a tiny constellation, and the
-next-hop loss was still decreasing, but reaching the shortest-path envelope needs a
-receptive field near the network diameter (10+ message-passing rounds) and a large
-training budget. That is cheap on the 4090 but exceeds a CPU anchor. **Run
-`scripts/run_full.sh` on the GPU and inspect `results/*.csv` before trusting any
-GLIDER number in the paper.** The paper's result macros for GLIDER are marked
-preliminary and must be regenerated.
+1. **The congestion opportunity is real.** Under calibrated skewed demand,
+   congestion-aware routing carries 15-28 points more demand than shortest path at
+   lower peak utilization on every shell.
+2. **Shortest-path-anchored deflection captures most of it, with guaranteed
+   delivery.** Restricting each hop to neighbours that make progress under the
+   shortest-path potential means the walk cannot loop and always arrives, whatever
+   the ranker says (`tests/test_deflection.py` proves this with random scores). The
+   best deflection policy (Deflect-Oracle) reaches 0.88-0.92 carried where SP is
+   0.54-0.64.
+
+**The open question this GPU run answers.** A *zero-learning* myopic heuristic
+(`Deflect-Local`) already captures the full deflection ceiling on small shells, so
+the learned model only earns its place if it beats Deflect-Local where that
+heuristic breaks down: on mega-constellations with long paths, where avoiding the
+next congested link walks you into congestion downstream. Training therefore runs on
+`starlink_shell1` (1584 satellites, ~10-hop paths).
+
+**The decision gate.** In `results/main_starlink_shell1_s*.csv`, GLIDER's
+`carried_fraction` must exceed `Deflect-Local`'s. In CPU anchor runs it did not yet
+(more training and receptive field needed); this full-budget run is the definitive
+test. If GLIDER does not clear Deflect-Local at full budget, the learned method does
+not stand, and the honest paper is about deflection, not about learning.
+
+> **Paper note.** `paper/main.tex` still describes the earlier "learned cost-to-go
+> replaces routing" design and is being rewritten around deflection once these
+> numbers land. Do not submit it as-is. Tables and figures under `paper/tables/` and
+> `paper/figs/` are regenerated from the run.
 
 ## What is (and is not) modelled
 

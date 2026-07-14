@@ -40,8 +40,10 @@ class ScenarioConfig:
     failure_min: float = 0.0
     failure_max: float = 0.10
     ca_iters: int = 20
-    # MSA iterations for DEFLECT-ORACLE, the teacher and the deflection ceiling.
-    deflect_iters: int = 12
+    # MSA iterations for DEFLECT-ORACLE, the teacher and the deflection ceiling. 8 is
+    # enough for the load to converge and keeps per-step label generation (the CPU
+    # bottleneck when training on a mega-constellation) affordable.
+    deflect_iters: int = 8
     net: NetworkConfig = field(default_factory=NetworkConfig)
     queue: QueueConfig = field(default_factory=QueueConfig)
     # Aggregate ground-to-ground demand (Gbps) at load_scale == 1.0.
