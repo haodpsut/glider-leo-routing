@@ -31,7 +31,10 @@ _METRIC_KEYS = [
 
 
 def load_model(ckpt_path: str, node_dim: int, edge_dim: int, device: torch.device) -> GLIDER:
-    ckpt = torch.load(ckpt_path, map_location=device)
+    # weights_only=True refuses to unpickle arbitrary objects. Our checkpoints hold
+    # only tensors plus a dict of primitives, so this is safe and forward-compatible
+    # with PyTorch flipping this default.
+    ckpt = torch.load(ckpt_path, map_location=device, weights_only=True)
     c = ckpt["cfg"]
     model = GLIDER(
         node_dim=node_dim, edge_dim=edge_dim,
