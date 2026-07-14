@@ -15,7 +15,13 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-from .baselines import route_ca_global, route_shortest_path, routing_edge_cost
+from .baselines import (
+    route_ca_global,
+    route_deflect_oracle,
+    route_shortest_path,
+    routing_edge_cost,
+    sp_potential,
+)
 from .constellation import Constellation, ConstellationSpec
 from .features import SnapshotFeatures, build_features, geo_term
 from .network import NetworkConfig, build_snapshot
@@ -34,9 +40,23 @@ class ScenarioConfig:
     failure_min: float = 0.0
     failure_max: float = 0.10
     ca_iters: int = 20
+    # MSA iterations for DEFLECT-ORACLE, the teacher and the deflection ceiling.
+    deflect_iters: int = 12
     net: NetworkConfig = field(default_factory=NetworkConfig)
     queue: QueueConfig = field(default_factory=QueueConfig)
-    traffic_base_gbps: float = 200.0
+    # Aggregate ground-to-ground demand (Gbps) at load_scale == 1.0.
+    #
+    # This value decides whether the routing problem exists at all, so it is
+    # calibrated, not guessed. Demand flows between a fixed set of ground stations,
+    # so the bottleneck sits in the mesh around the ground-station access points and
+    # does NOT scale with satellite count. Measured SP -> CA-Global carried-demand
+    # gap at load_scale 1.0 (three scenarios each):
+    #     base=300 : medium +6pp,  starlink  0pp,  kuiper  0pp   <- too light, SP is
+    #                already near-optimal and there is nothing to win
+    #     base=450 : medium +15pp, starlink +20pp, kuiper +14pp  <- used here
+    #     base=550 : medium +7pp   <- so heavy that even CA-Global collapses
+    # Setting this too low is what makes shortest path look unbeatable.
+    traffic_base_gbps: float = 450.0
 
 
 @dataclass
@@ -100,13 +120,25 @@ def training_pairs(
     rng: np.random.Generator,
     max_pairs_per_dest: int = 64,
 ) -> TrainingSample:
-    """Build cost-to-go regression pairs and next-hop imitation targets."""
+    """Build cost-to-go regression pairs and next-hop imitation targets.
+
+    Supervision comes from DEFLECT-ORACLE (the best policy inside the same
+    progress-restricted action space the learner will act in), not from unrestricted
+    CA-Global. Imitating a teacher that can take actions the student cannot is a
+    mismatch; here teacher and student share an action space, so the student can in
+    principle reach the teacher.
+
+    Next-hop candidates are restricted to *progressing* neighbours
+    (D(v,d) < D(u,d)), matching inference exactly.
+    """
     snap = scenario.snapshot
-    _paths, ca_weight, ctg = route_ca_global(
-        snap, scenario.demands, cfg.queue, iters=cfg.ca_iters, return_labels=True
+    _paths, ctg, oracle_load = route_deflect_oracle(
+        snap, scenario.demands, cfg.queue, iters=cfg.deflect_iters, return_labels=True
     )
+    oracle_cost = routing_edge_cost(snap, oracle_load, cfg.queue)
     feats = build_features(snap, scenario.warmup_load)
     obs_cost = routing_edge_cost(snap, scenario.warmup_load, cfg.queue)
+    pot_cache: dict[int, np.ndarray] = {}
 
     src_list: list[int] = []
     dst_list: list[int] = []
@@ -120,6 +152,10 @@ def training_pairs(
     BIG = 1.0e6
 
     for dest, costs in ctg.items():
+        if dest not in pot_cache:
+            pot_cache[dest] = sp_potential(snap, dest)
+        pot = pot_cache[dest]
+
         finite = np.where(np.isfinite(costs))[0]
         finite = finite[finite != dest]
         if len(finite) == 0:
@@ -131,19 +167,29 @@ def training_pairs(
             dst_list.append(int(dest))
             tgt_list.append(float(costs[v]))
 
-            # Next-hop target: neighbour minimising ca_edge_cost + ca_cost_to_go.
-            nbrs = snap.out_neighbors[v]
-            best_w, best_val, best_j = -1, np.inf, -1
+            # Candidates = progressing neighbours only, exactly as at inference.
+            # Target = the one DEFLECT-ORACLE takes (min oracle_cost + oracle ctg).
+            best_val, best_j = np.inf, -1
             row_nbr, row_obs, row_mask = [], [], []
-            for j, (w, e) in enumerate(nbrs[:K]):
+            d_v = pot[v]
+            j = 0
+            for w, e in snap.out_neighbors[v]:
+                if j >= K:
+                    break
+                if not np.isfinite(pot[w]) or pot[w] >= d_v:
+                    continue  # not progressing
                 cg = costs[w]
-                val = ca_weight[e] + cg
+                if not np.isfinite(cg):
+                    continue
                 row_nbr.append(w)
                 row_obs.append(float(obs_cost[e]))
-                row_mask.append(np.isfinite(cg))
-                if np.isfinite(cg) and val < best_val:
-                    best_val, best_w, best_j = val, w, j
-            if best_j < 0:
+                row_mask.append(True)
+                val = oracle_cost[e] + cg
+                if val < best_val:
+                    best_val, best_j = val, j
+                j += 1
+            # A single candidate carries no decision, so it teaches nothing.
+            if best_j < 0 or len(row_nbr) < 2:
                 continue
             # Pad to K.
             pad = K - len(row_nbr)

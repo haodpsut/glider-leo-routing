@@ -15,7 +15,7 @@ from __future__ import annotations
 import numpy as np
 
 from .network import NetworkSnapshot
-from .queueing import QueueConfig, reverse_dijkstra, trace_path
+from .queueing import INF, QueueConfig, reverse_dijkstra, trace_path
 from .traffic import Demand
 
 _OVERLOAD_PENALTY_MS = 1.0e4
@@ -38,6 +38,154 @@ def routing_edge_cost(snapshot: NetworkSnapshot, load_gbps: np.ndarray, qcfg: Qu
 
 def _destinations(demands: list[Demand]) -> list[int]:
     return sorted({d.dst_node for d in demands})
+
+
+# --------------------------------------------------------------------------------
+# Shortest-path-anchored deflection.
+#
+# Replacing routing wholesale with a greedy walk on a *learned* cost-to-go fails for
+# a structural reason: greedy must pick the right neighbour at EVERY hop, so with
+# per-hop accuracy p the delivery rate over an H-hop path decays like p^H (p=0.9,
+# H=8 delivers only 43%). No amount of training reaches the ~99.4% per-hop accuracy
+# that a 95% delivery rate over 8 hops demands.
+#
+# We therefore anchor on the shortest-path potential D(.,d) (plain reverse Dijkstra
+# on propagation delay, exactly what a link-state protocol already computes) and
+# restrict every forwarding decision to neighbours that make progress under it:
+#
+#     A(u,d) = { v in N(u) : D(v,d) < D(u,d) }
+#
+# D strictly decreases along any such walk, so the walk cannot loop and must reach d
+# in finitely many hops: DELIVERY IS GUARANTEED BY CONSTRUCTION, whatever the policy
+# does inside A(u,d). The learned part only chooses *which* progressing neighbour to
+# take, which is where congestion-awareness lives (a +Grid offers many equal-cost
+# shortest paths, so there is a lot of load-balancing freedom without any stretch).
+# A policy in this class can never do worse than shortest path by dropping traffic.
+# --------------------------------------------------------------------------------
+
+
+def sp_potential(snapshot: NetworkSnapshot, dest: int) -> np.ndarray:
+    """Shortest-path cost-to-go on propagation delay: the deflection anchor D(.,d)."""
+    return reverse_dijkstra(snapshot, dest, snapshot.prop_delay_ms)
+
+
+def trace_deflect(
+    snapshot: NetworkSnapshot,
+    src: int,
+    dest: int,
+    potential: np.ndarray,     # D(.,d), the progress anchor
+    score: np.ndarray,         # per-node cost-to-go used to rank progressing neighbours
+    edge_cost: np.ndarray,     # observed per-edge cost (propagation + queueing)
+    max_hops: int,
+) -> list[int] | None:
+    """Route src->dest choosing, among progressing neighbours, the cheapest by
+    ``edge_cost + score``.
+
+    Returns None only if ``dest`` is unreachable from ``src`` (D infinite). Otherwise
+    delivery is guaranteed, because every hop strictly decreases the potential.
+    """
+    if src == dest:
+        return [src]
+    if not np.isfinite(potential[src]):
+        return None
+    path = [src]
+    node = src
+    for _ in range(max_hops):
+        best_node, best_val = -1, INF
+        d_node = potential[node]
+        for v, e in snapshot.out_neighbors[node]:
+            if not np.isfinite(potential[v]) or potential[v] >= d_node:
+                continue  # not a progressing neighbour
+            val = edge_cost[e] + score[v]
+            if val < best_val:
+                best_val, best_node = val, v
+        if best_node < 0:
+            return None  # unreachable (cannot happen when potential[node] is finite)
+        path.append(best_node)
+        if best_node == dest:
+            return path
+        node = best_node
+    return None
+
+
+def route_deflect(
+    snapshot: NetworkSnapshot,
+    demands: list[Demand],
+    qcfg: QueueConfig,
+    score_by_dest: dict[int, np.ndarray],
+    load_gbps: np.ndarray,
+) -> list[tuple[Demand, list[int]]]:
+    """Deflection routing given a per-destination score and an observed load."""
+    edge_cost = routing_edge_cost(snapshot, load_gbps, qcfg)
+    out: list[tuple[Demand, list[int]]] = []
+    pot_cache: dict[int, np.ndarray] = {}
+    for demand in demands:
+        d = demand.dst_node
+        if d not in pot_cache:
+            pot_cache[d] = sp_potential(snapshot, d)
+        path = trace_deflect(
+            snapshot, demand.src_node, d, pot_cache[d], score_by_dest[d], edge_cost, qcfg.max_hops
+        )
+        out.append((demand, path))
+    return out
+
+
+def route_deflect_local(
+    snapshot: NetworkSnapshot,
+    demands: list[Demand],
+    qcfg: QueueConfig,
+    load_gbps: np.ndarray,
+) -> list[tuple[Demand, list[int]]]:
+    """Myopic congestion-greedy deflection: no learning at all.
+
+    Ranks progressing neighbours by ``observed_edge_cost + D(v,d)``, i.e. it avoids
+    the locally congested link and otherwise trusts the shortest-path potential.
+
+    This is the baseline that decides whether a learned ranker is worth anything. On
+    a small constellation it already captures essentially the entire deflection
+    ceiling, so learning buys nothing there. Its weakness is myopia: it sees only the
+    next link's queue, so on a mega-constellation with long paths it walks into
+    congestion further downstream, and on some shells it is even WORSE than plain
+    shortest path. Anticipating downstream congestion is precisely what a learned
+    cost-to-go is for, and beating this baseline is the bar GLIDER must clear.
+    """
+    dests = _destinations(demands)
+    pot = {d: sp_potential(snapshot, d) for d in dests}
+    return route_deflect(snapshot, demands, qcfg, pot, load_gbps)
+
+
+def route_deflect_oracle(
+    snapshot: NetworkSnapshot,
+    demands: list[Demand],
+    qcfg: QueueConfig,
+    iters: int = 12,
+    return_labels: bool = False,
+):
+    """Best achievable deflection policy: ranks progressing neighbours with the
+    converged CA-Global cost-to-go and full knowledge of the load.
+
+    This is the CEILING of the deflection action space. A learned policy in this
+    class cannot beat it, so if this does not beat shortest path there is nothing to
+    learn and the whole approach should be abandoned.
+    """
+    from .queueing import aggregate_loads
+
+    load = np.zeros(snapshot.num_edges)
+    paths: list[tuple[Demand, list[int]]] = []
+    ctg: dict[int, np.ndarray] = {}
+    for k in range(iters):
+        weight = routing_edge_cost(snapshot, load, qcfg)
+        ctg = {d: reverse_dijkstra(snapshot, d, weight) for d in _destinations(demands)}
+        paths = route_deflect(snapshot, demands, qcfg, ctg, load)
+        new_load = aggregate_loads(snapshot, paths)
+        load = load + (1.0 / (k + 2.0)) * (new_load - load)  # MSA damping
+
+    weight = routing_edge_cost(snapshot, load, qcfg)
+    ctg = {d: reverse_dijkstra(snapshot, d, weight) for d in _destinations(demands)}
+    paths = route_deflect(snapshot, demands, qcfg, ctg, load)
+    if return_labels:
+        return paths, ctg, load
+    return paths
 
 
 def _route_with_weights(

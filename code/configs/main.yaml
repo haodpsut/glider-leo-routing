@@ -8,7 +8,10 @@ steps: 4000
 lr: 1.0e-3
 weight_decay: 1.0e-5
 hidden: 128
-num_layers: 10
+# 6 rounds with residual + LayerNorm + mean/max aggregation. The earlier 10-round
+# mean-only stack over-smoothed: node embeddings collapsed toward the graph average
+# and the no-message-passing ablation beat it.
+num_layers: 6
 use_messages: true
 eval_every: 500
 eval_scenarios: 8
@@ -16,15 +19,28 @@ max_pairs_per_dest: 96
 log_every: 50
 
 scenario:
-  presets: [medium]
+  # Train on a mega-constellation, NOT on a small one. Measured headroom for learning
+  # (DEFLECT-ORACLE minus the zero-learning DEFLECT-LOCAL heuristic):
+  #     medium   (384 sats,  7.0 hops): +0.006  <- nothing to learn; the free
+  #                                               heuristic already hits the ceiling
+  #     telesat  (351 sats,  6.8 hops): +0.042
+  #     kuiper   (1156 sats, 9.7 hops): +0.120
+  #     starlink (1584 sats, 10.0 hops): +0.175 <- trained here
+  # Myopic congestion-greed only breaks down when paths are long, so a model trained
+  # on a small shell learns a problem that does not exist.
+  presets: [starlink_shell1]
   n_ground_stations: 14
   epoch_max_s: 5600.0
-  load_min: 0.7
-  load_max: 1.6
+  load_min: 0.8
+  load_max: 1.2
   failure_min: 0.0
   failure_max: 0.12
   ca_iters: 20
-  traffic_base_gbps: 180.0
+  # Calibrated so the congestion the paper is about actually exists: at this demand
+  # SP carries ~0.6 while CA-Global carries ~0.8 (a 15-20 point gap) on every shell.
+  # The previous value (180) left the mesh uncongested, SP was near-optimal, and
+  # there was nothing for a congestion-aware policy to win.
+  traffic_base_gbps: 450.0
   net:
     isl_capacity_gbps: 20.0
     gsl_capacity_gbps: 80.0

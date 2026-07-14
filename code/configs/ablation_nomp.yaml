@@ -8,7 +8,7 @@ steps: 4000
 lr: 1.0e-3
 weight_decay: 1.0e-5
 hidden: 192
-num_layers: 10
+num_layers: 6
 use_messages: false
 eval_every: 500
 eval_scenarios: 8
@@ -16,15 +16,15 @@ max_pairs_per_dest: 96
 log_every: 50
 
 scenario:
-  presets: [medium]
+  presets: [starlink_shell1]   # must match main.yaml
   n_ground_stations: 14
   epoch_max_s: 5600.0
-  load_min: 0.7
-  load_max: 1.6
+  load_min: 0.8
+  load_max: 1.2
   failure_min: 0.0
   failure_max: 0.12
   ca_iters: 20
-  traffic_base_gbps: 180.0
+  traffic_base_gbps: 450.0   # must match main.yaml: same problem, different model
   net:
     isl_capacity_gbps: 20.0
     gsl_capacity_gbps: 80.0

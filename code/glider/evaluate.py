@@ -15,14 +15,26 @@ from dataclasses import asdict
 import numpy as np
 import torch
 
-from .baselines import route_ca_global, route_shortest_path
+from .baselines import (
+    route_ca_global,
+    route_deflect_local,
+    route_deflect_oracle,
+    route_shortest_path,
+)
 from .config import load_train_config
 from .dataset import ScenarioConfig, sample_scenario
 from .model import GLIDER
 from .policy import route_glider
 from .queueing import RoutingMetrics, evaluate_routing
 
-METHODS = ["sp", "ca_global", "glider"]
+# The four references that bracket GLIDER:
+#   sp             - congestion-oblivious shortest path, the deployed rule.
+#   deflect_local  - myopic congestion-greedy deflection, NO learning. The bar that
+#                    matters: if GLIDER cannot beat this, the model earns nothing.
+#   deflect_oracle - best possible deflection with global load knowledge: the ceiling
+#                    of GLIDER's own action space.
+#   ca_global      - unrestricted centralized congestion-aware routing.
+METHODS = ["sp", "deflect_local", "ca_global", "deflect_oracle", "glider"]
 _METRIC_KEYS = [
     "mean_latency_ms", "p95_latency_ms", "max_utilization",
     "overloaded_edges", "carried_fraction", "delivered_flows",
@@ -54,7 +66,10 @@ def evaluate_methods(
     seed: int,
     methods: list[str] | None = None,
 ) -> dict[str, list[RoutingMetrics]]:
-    methods = methods or (METHODS if model is not None else ["sp", "ca_global"])
+    methods = methods or (
+        METHODS if model is not None
+        else ["sp", "deflect_local", "ca_global", "deflect_oracle"]
+    )
     rng = np.random.default_rng(seed)
     out: dict[str, list[RoutingMetrics]] = {m: [] for m in methods}
 
@@ -63,9 +78,19 @@ def evaluate_methods(
         for m in methods:
             if m == "sp":
                 paths = route_shortest_path(scenario.snapshot, scenario.demands, scenario.qcfg)
+            elif m == "deflect_local":
+                # Sees exactly the load GLIDER sees, so the only difference is the ranker.
+                paths = route_deflect_local(
+                    scenario.snapshot, scenario.demands, scenario.qcfg, scenario.warmup_load
+                )
             elif m == "ca_global":
                 paths = route_ca_global(
                     scenario.snapshot, scenario.demands, scenario.qcfg, iters=scen_cfg.ca_iters
+                )
+            elif m == "deflect_oracle":
+                paths = route_deflect_oracle(
+                    scenario.snapshot, scenario.demands, scenario.qcfg,
+                    iters=scen_cfg.deflect_iters,
                 )
             elif m == "glider":
                 assert model is not None

@@ -30,20 +30,22 @@ def test_train_and_evaluate(tmp_path):
     model = load_model(ckpt, NODE_FEAT_DIM, EDGE_FEAT_DIM, device)
     results = evaluate_methods(cfg.scenario, model, device, n_scenarios=4, seed=7)
 
-    assert set(results.keys()) == {"sp", "ca_global", "glider"}
+    assert set(results.keys()) == {
+        "sp", "deflect_local", "ca_global", "deflect_oracle", "glider",
+    }
     for method, mets in results.items():
         assert len(mets) == 4
         for m in mets:
             assert 0.0 <= m.carried_fraction <= 1.0
             assert m.total_flows > 0
 
-    # Deterministic baselines must deliver essentially all demand on this
-    # well-provisioned smoke topology; the learned policy must produce a valid
-    # routing that delivers a non-trivial share of flows.
     def mean_carried(m):
         return float(np.mean([x.carried_fraction for x in results[m]]))
 
     assert mean_carried("sp") > 0.8
     assert mean_carried("ca_global") > 0.8
-    assert mean_carried("glider") > 0.3
-    assert sum(x.delivered_flows for x in results["glider"]) > 0
+    # The learned policy routes inside the progress-restricted action space, so even
+    # barely trained it must deliver: it cannot loop or wander off. This is far
+    # stronger than the old unrestricted-greedy expectation and is the whole point of
+    # the deflection design.
+    assert mean_carried("glider") > 0.8

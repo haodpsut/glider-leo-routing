@@ -28,25 +28,49 @@ def _mlp(sizes: list[int], out_act: nn.Module | None = None) -> nn.Sequential:
 
 
 class MessagePassingLayer(nn.Module):
-    """One round of edge-conditioned, mean-aggregated message passing."""
+    """One round of edge-conditioned message passing, built to resist over-smoothing.
+
+    Three deliberate choices, each fixing a way that a deep mean-aggregation stack
+    destroys the signal a routing decision needs:
+
+    * **mean AND max aggregation.** Mean alone is a low-pass filter: stack enough
+      rounds and every node embedding converges to the graph average, so the readout
+      can no longer tell one neighbour from another and next-hop ranking degenerates
+      into noise. Max preserves distinctive signals (e.g. one saturated downstream
+      link) that the mean washes out.
+    * **Residual connection.** The layer learns an update to ``h`` rather than
+      replacing it, so a node's own identity and position survive to the last layer.
+    * **LayerNorm.** Keeps activations in scale across many rounds.
+
+    Empirically the previous mean-only, non-residual variant at 10 layers was beaten
+    by a no-message-passing MLP, which is exactly the signature of over-smoothing.
+    """
 
     def __init__(self, hidden: int, edge_dim: int):
         super().__init__()
         self.msg = _mlp([2 * hidden + edge_dim, hidden, hidden])
-        self.upd = nn.GRUCell(hidden, hidden)
+        # Update sees its own state plus both aggregates.
+        self.upd = _mlp([3 * hidden, hidden, hidden])
+        self.norm = nn.LayerNorm(hidden)
 
     def forward(self, h: torch.Tensor, edge_index: torch.Tensor, edge_feat: torch.Tensor) -> torch.Tensor:
         src, tgt = edge_index[0], edge_index[1]
-        msg_in = torch.cat([h[src], h[tgt], edge_feat], dim=1)
-        m = self.msg(msg_in)                                   # (E, hidden)
+        m = self.msg(torch.cat([h[src], h[tgt], edge_feat], dim=1))   # (E, hidden)
 
-        agg = torch.zeros_like(h)
-        agg.index_add_(0, tgt, m)                              # sum messages at target
+        # Mean aggregation.
+        agg_sum = torch.zeros_like(h)
+        agg_sum.index_add_(0, tgt, m)
         deg = torch.zeros(h.size(0), device=h.device)
         deg.index_add_(0, tgt, torch.ones(tgt.size(0), device=h.device))
-        agg = agg / deg.clamp(min=1.0).unsqueeze(1)            # mean aggregation
+        agg_mean = agg_sum / deg.clamp(min=1.0).unsqueeze(1)
 
-        return self.upd(agg, h)                                # gated update
+        # Max aggregation. include_self=False leaves nodes with no incoming edge at
+        # the zero init rather than -inf, so isolated nodes stay finite.
+        idx = tgt.unsqueeze(1).expand(-1, h.size(1))
+        agg_max = torch.zeros_like(h).scatter_reduce(0, idx, m, reduce="amax", include_self=False)
+
+        delta = self.upd(torch.cat([h, agg_mean, agg_max], dim=1))
+        return self.norm(h + delta)                                    # residual
 
 
 class GLIDER(nn.Module):

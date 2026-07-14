@@ -1,10 +1,15 @@
-"""GLIDER inference: turn a trained model into a distributed greedy routing.
+"""GLIDER inference: shortest-path-anchored deflection with a learned ranker.
 
-At inference every node forwards toward destination ``d`` by choosing the neighbour
-minimising ``observed_edge_cost(u, v) + Q_hat(v, d)``. ``Q_hat`` comes from the GNN
-embeddings; the observed edge cost uses the warm-up (locally observable) congestion
-state. Only 1-hop neighbour embeddings and the destination embedding are needed per
-hop, so the rule is distributed.
+Each node knows the shortest-path potential D(.,d) (plain link-state Dijkstra on
+propagation delay, which routers already compute) and restricts its choice to
+neighbours that make progress under it. Among those it forwards to the one
+minimising ``observed_edge_cost(u,v) + Q_theta(v,d)``.
+
+Delivery is guaranteed by construction: D strictly decreases every hop, so the walk
+cannot loop and must reach the destination. The learned model can only change *which*
+shortest-ish path is taken, never whether the packet arrives. That is what bounds
+this policy below by shortest path, and it is why replacing the unrestricted greedy
+walk with this one removes the p^H compounding-error failure mode.
 """
 
 from __future__ import annotations
@@ -12,26 +17,42 @@ from __future__ import annotations
 import numpy as np
 import torch
 
-from .baselines import routing_edge_cost
+from .baselines import routing_edge_cost, sp_potential, trace_deflect
 from .dataset import Scenario
 from .features import build_features, geo_term
 from .model import GLIDER
-from .queueing import QueueConfig, trace_path
+from .queueing import QueueConfig
 
 
 @torch.no_grad()
-def predict_cost_to_go_all(
+def glider_scores(
     model: GLIDER,
     scenario: Scenario,
     device: torch.device,
-) -> tuple[torch.Tensor, np.ndarray, object]:
-    """Return node embeddings, node positions, and the snapshot feature bundle."""
-    feats = build_features(scenario.snapshot, scenario.warmup_load)
-    node_feat = torch.from_numpy(feats.node_feat).to(device)
-    edge_index = torch.from_numpy(feats.edge_index).to(device)
-    edge_feat = torch.from_numpy(feats.edge_feat).to(device)
-    h = model.embed(node_feat, edge_index, edge_feat)
-    return h, feats.node_pos, feats
+    destinations: list[int],
+) -> dict[int, np.ndarray]:
+    """Predicted cost-to-go Q_theta(., d) for every node and each destination."""
+    snapshot = scenario.snapshot
+    feats = build_features(snapshot, scenario.warmup_load)
+    h = model.embed(
+        torch.from_numpy(feats.node_feat).to(device),
+        torch.from_numpy(feats.edge_index).to(device),
+        torch.from_numpy(feats.edge_feat).to(device),
+    )
+    all_nodes = np.arange(snapshot.num_nodes, dtype=np.int64)
+    out: dict[int, np.ndarray] = {}
+    for dest in destinations:
+        dst_idx = np.full(snapshot.num_nodes, dest, dtype=np.int64)
+        geo = geo_term(feats.node_pos, all_nodes, dst_idx)
+        q = model.cost_to_go(
+            h,
+            torch.from_numpy(all_nodes).to(device),
+            torch.from_numpy(dst_idx).to(device),
+            torch.from_numpy(geo).to(device),
+        ).cpu().numpy()
+        q[dest] = 0.0
+        out[dest] = q
+    return out
 
 
 @torch.no_grad()
@@ -41,32 +62,22 @@ def route_glider(
     qcfg: QueueConfig,
     device: torch.device,
 ) -> list[tuple[object, list[int]]]:
-    """Produce (demand, path) routing under the learned greedy policy."""
+    """Route every demand under the learned deflection policy."""
     model.eval()
     snapshot = scenario.snapshot
-    h, node_pos, _feats = predict_cost_to_go_all(model, scenario, device)
-
-    # Observed congestion-aware forwarding cost (locally measurable queue state).
-    edge_weight = routing_edge_cost(snapshot, scenario.warmup_load, qcfg)
-
-    all_nodes = np.arange(snapshot.num_nodes, dtype=np.int64)
     destinations = sorted({d.dst_node for d in scenario.demands})
+    q_by_dest = glider_scores(model, scenario, device, destinations)
 
-    # Precompute predicted cost-to-go array per destination.
-    q_by_dest: dict[int, np.ndarray] = {}
-    for dest in destinations:
-        dst_idx = np.full(snapshot.num_nodes, dest, dtype=np.int64)
-        geo = geo_term(node_pos, all_nodes, dst_idx)
-        src_t = torch.from_numpy(all_nodes).to(device)
-        dst_t = torch.from_numpy(dst_idx).to(device)
-        geo_t = torch.from_numpy(geo).to(device)
-        q = model.cost_to_go(h, src_t, dst_t, geo_t).cpu().numpy()
-        q[dest] = 0.0
-        q_by_dest[dest] = q
+    # Locally observable congestion cost, and the shortest-path progress anchor.
+    edge_cost = routing_edge_cost(snapshot, scenario.warmup_load, qcfg)
+    pot_by_dest = {d: sp_potential(snapshot, d) for d in destinations}
 
     demand_paths: list[tuple[object, list[int]]] = []
     for demand in scenario.demands:
-        q = q_by_dest[demand.dst_node]
-        path = trace_path(snapshot, demand.src_node, demand.dst_node, q, edge_weight, qcfg.max_hops)
+        d = demand.dst_node
+        path = trace_deflect(
+            snapshot, demand.src_node, d,
+            pot_by_dest[d], q_by_dest[d], edge_cost, qcfg.max_hops,
+        )
         demand_paths.append((demand, path))
     return demand_paths
